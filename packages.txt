@@ -3,3 +3,4 @@ libgdal-dev
 python3-gdal
 build-essential
 libgl1
+libspatialindex-dev
