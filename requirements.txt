@@ -7,7 +7,3 @@ geopandas
 rasterio
 torch
 torchvision
-
-Note: CUDA-enabled PyTorch is highly recommended for SAM performance.
-
-Visit https://pytorch.org/get-started/locally/ for specific install commands.
