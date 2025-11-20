@@ -14,3 +14,4 @@ segment-geospatial
 opencv-python-headless
 geopandas
 rasterio
+segment-geospatial
