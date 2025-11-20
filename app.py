@@ -1,206 +1,213 @@
 import streamlit as st
-import geemap.foliumap as geemap
 import ee
+import geemap.foliumap as geemap
 import os
-from samgeo import SamGeo2, tms_to_geotiff
-import geopandas as gpd
 import tempfile
-import rasterio
-from rasterio.plot import show
-import numpy as np
-import pandas as pd
-from google.oauth2 import service_account
 
 # --- Page Configuration ---
-st.set_page_config(layout="wide", page_title="Crop Boundary Detection (SAM 2/3)")
+st.set_page_config(layout="wide", page_title="AgriBoundary: Field Detector")
 
-st.title("🌱 Crop Field Delineation with GEE & SAM")
+# --- Custom CSS ---
 st.markdown("""
-This app extracts crop boundaries from satellite imagery using **Google Earth Engine** and **Meta's Segment Anything Model (SAM 2)**. 
-*Note: SAM 3 checkpoints can be used here once supported by the underlying libraries.*
-""")
+    <style>
+    .stApp {
+        background-color: #f8f9fa;
+    }
+    .main-header {
+        font-size: 2.5rem;
+        color: #2c3e50;
+        font-weight: 700;
+    }
+    .info-box {
+        background-color: #e1f5fe;
+        padding: 15px;
+        border-radius: 10px;
+        border-left: 5px solid #0288d1;
+        margin-bottom: 20px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
-# --- Sidebar & Controls ---
-with st.sidebar:
-    st.header("1. Configuration")
-    
-    # GEE Initialization with Service Account
+# --- Title & Intro ---
+st.markdown('<div class="main-header">🌾 AgriBoundary Detector</div>', unsafe_allow_html=True)
+st.markdown("""
+<div class="info-box">
+    <b>How it works:</b><br>
+    1. Upload a KML file containing your Area of Interest (AOI).<br>
+    2. The app fetches Sentinel-2 satellite imagery for that area.<br>
+    3. It applies the SNIC segmentation algorithm to detect field boundaries.<br>
+    4. You can download the resulting boundaries as a KML file.
+</div>
+""", unsafe_allow_html=True)
+
+# --- GEE Initialization ---
+def initialize_gee():
     try:
-        if "gcp_service_account" in st.secrets:
-            # 1. Load secrets
-            service_account_info = dict(st.secrets["gcp_service_account"])
-            
-            # 2. Handle newline characters in private key (Fix for TOML escaping)
-            if "private_key" in service_account_info:
-                service_account_info["private_key"] = service_account_info["private_key"].replace("\\n", "\n")
-
-            # 3. Create Credentials
-            creds = service_account.Credentials.from_service_account_info(service_account_info)
-            
-            # 4. Initialize Earth Engine
-            project_id = service_account_info.get("project_id")
-            ee.Initialize(credentials=creds, project=project_id)
-            
-            st.success(f"GEE Initialized! \nProject: {project_id}")
-        else:
-            st.warning("Secrets [gcp_service_account] not found. Trying default auth...")
-            ee.Initialize()
-            st.success("GEE Initialized (Default)")
-            
+        ee.Initialize()
+        return True
     except Exception as e:
-        st.error(f"GEE Initialization failed: {e}")
-        st.info("Check your .streamlit/secrets.toml file. Ensure the 'private_key' is correct.")
-        st.stop()
+        st.warning("GEE not initialized. Trying to authenticate...")
+        try:
+            ee.Authenticate()
+            ee.Initialize()
+            return True
+        except Exception as e2:
+            st.error(f"Authentication failed: {e2}")
+            st.info("Please run `earthengine authenticate` in your terminal first.")
+            return False
 
+if not initialize_gee():
+    st.stop()
+
+# --- Sidebar Controls ---
+with st.sidebar:
+    st.header("⚙️ Parameters")
+    
+    # Date Range
+    start_date = st.date_input("Start Date", value=import_datetime_date(2023, 5, 1))
+    end_date = st.date_input("End Date", value=import_datetime_date(2023, 9, 30))
+    
+    # Cloud Filter
+    cloud_pct = st.slider("Max Cloud Cover %", 0, 30, 10)
+    
+    # Segmentation Parameters (SNIC)
+    st.subheader("Segmentation Tuning")
+    seed_grid_size = st.slider("Grid/Seed Size (Pixels)", 10, 100, 30, help="Smaller = smaller fields, Larger = larger fields")
+    compactness = st.slider("Compactness", 0.0, 2.0, 0.5, help="Shape vs Color importance")
+    
     st.divider()
+    st.caption("Powered by Google Earth Engine & Streamlit")
+
+# --- Helper Functions ---
+
+def get_sentinel_image(geometry, start, end, cloud_max):
+    """Fetches and masks Sentinel-2 imagery."""
+    def mask_s2_clouds(image):
+        qa = image.select('QA60')
+        cloud_bit_mask = 1 << 10
+        cirrus_bit_mask = 1 << 11
+        mask = qa.bitwiseAnd(cloud_bit_mask).eq(0).And(
+            qa.bitwiseAnd(cirrus_bit_mask).eq(0))
+        return image.updateMask(mask).divide(10000)
+
+    dataset = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
+        .filterDate(str(start), str(end)) \
+        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', cloud_max)) \
+        .filterBounds(geometry) \
+        .map(mask_s2_clouds)
     
-    st.header("2. Data Parameters")
-    start_date = st.date_input("Start Date", value=pd.to_datetime("2023-06-01"))
-    end_date = st.date_input("End Date", value=pd.to_datetime("2023-06-30"))
-    cloud_cover = st.slider("Max Cloud Cover (%)", 0, 30, 10)
+    # Return the median composite to minimize clouds/artifacts
+    return dataset.median().clip(geometry)
+
+def detect_boundaries(image, geometry, size, compact):
+    """Applies SNIC segmentation to detect boundaries."""
     
-    st.divider()
+    # Select bands for segmentation (Visible + NIR usually best for fields)
+    bands = ['B2', 'B3', 'B4', 'B8']
+    input_image = image.select(bands)
     
-    st.header("3. Model Settings")
-    # OPTIMIZATION: Default to 'tiny' (index 2) to prevent memory crashes on Cloud
-    model_type = st.selectbox(
-        "SAM Model Type", 
-        ["sam2_hiera_large", "sam2_hiera_small", "sam2_hiera_tiny"],
-        index=2, 
-        help="Use 'Tiny' for Streamlit Cloud. 'Large' requires a powerful local GPU."
+    # Create seeds
+    seeds = ee.Algorithms.Image.Segmentation.seedGrid(size)
+    
+    # Run SNIC
+    snic = ee.Algorithms.Image.Segmentation.SNIC(
+        image=input_image, 
+        compactness=compact,
+        connectivity=8,
+        neighborhoodSize=2 * size,
+        seeds=seeds
     )
     
-    st.info("For SAM 3: Once 'segment-geospatial' updates, select the SAM 3 checkpoint here.")
+    clusters = snic.select('clusters')
+    
+    # Vectorize the clusters (Raster -> Vector)
+    vectors = clusters.reduceToVectors(
+        geometry=geometry,
+        scale=10, # Sentinel-2 resolution
+        geometryType='polygon',
+        eightConnected=False,
+        labelProperty='cluster_id'
+    )
+    
+    return vectors, snic.select(bands).reproject(crs=snic.projection(), scale=10)
 
 # --- Main Logic ---
 
-# 1. Upload KML
-st.subheader("1. Upload Area of Interest (KML)")
-uploaded_kml = st.file_uploader("Upload a KML file defining your AOI", type=['kml'])
+uploaded_file = st.file_uploader("Upload AOI (KML file)", type=['kml'])
 
-if uploaded_kml:
-    # Save KML to temp file to read it
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".kml") as tmp_kml:
-        tmp_kml.write(uploaded_kml.getvalue())
-        kml_path = tmp_kml.name
+# Map initialization
+m = geemap.Map(height=600)
+m.add_basemap("HYBRID")
 
-    # Convert KML to EE Geometry
+if uploaded_file is not None:
     try:
-        # We use geemap to convert KML to EE object
-        gpd_df = gpd.read_file(kml_path)
-        # Reproject to WGS84 if needed
-        if gpd_df.crs != "EPSG:4326":
-            gpd_df = gpd_df.to_crs("EPSG:4326")
+        # Save uploaded KML to a temp file so geemap can read it
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.kml') as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            tmp_path = tmp_file.name
+
+        # Convert KML to EE Geometry
+        # Note: geemap uses internal logic to parse KML. If complex, might need fiona.
+        # We assume simple polygon KML here.
+        aoi_ee = geemap.kml_to_ee(tmp_path)
         
-        # Convert the first polygon to GEE geometry
-        aoi_coords = list(gpd_df.geometry[0].exterior.coords)
-        aoi = ee.Geometry.Polygon(aoi_coords)
+        # If aoi_ee is a FeatureCollection, get the geometry union
+        if isinstance(aoi_ee, ee.FeatureCollection):
+            aoi_geometry = aoi_ee.geometry()
+        else:
+            aoi_geometry = aoi_ee
+
+        # Center Map
+        m.centerObject(aoi_geometry, 13)
         
-        st.success(f"AOI Loaded. Centroid: {gpd_df.geometry[0].centroid}")
-    except Exception as e:
-        st.error(f"Error parsing KML: {e}")
-        st.stop()
+        with st.spinner('Processing Satellite Imagery...'):
+            # 1. Get Imagery
+            s2_image = get_sentinel_image(aoi_geometry, start_date, end_date, cloud_pct)
+            
+            # Display True Color Image
+            vis_params = {'min': 0.0, 'max': 0.3, 'bands': ['B4', 'B3', 'B2']}
+            m.addLayer(s2_image, vis_params, 'Sentinel-2 Imagery')
+            
+            # 2. Run Segmentation
+            vectors, snic_raster = detect_boundaries(s2_image, aoi_geometry, seed_grid_size, compactness)
+            
+            # Display Segmentation
+            m.addLayer(vectors, {'color': 'red', 'width': 2}, 'Detected Boundaries')
 
-    # 2. Fetch Sentinel-2 Imagery
-    st.subheader("2. Satellite Imagery (Sentinel-2)")
-    
-    def get_sentinel_image(roi, start, end, clouds):
-        s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED") \
-            .filterBounds(roi) \
-            .filterDate(str(start), str(end)) \
-            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', clouds)) \
-            .median() \
-            .clip(roi)
-        return s2
-
-    s2_image = get_sentinel_image(aoi, start_date, end_date, cloud_cover)
-    
-    # Visual Parameters
-    vis_params = {
-        'min': 0,
-        'max': 3000,
-        'bands': ['B4', 'B3', 'B2'] # RGB
-    }
-    
-    # Preview Map
-    m = geemap.Map()
-    m.centerObject(aoi, 14)
-    m.addLayer(s2_image, vis_params, 'Sentinel-2 Image')
-    m.addLayer(aoi, {'color': 'red'}, 'AOI')
-    
-    # Display map
-    st.markdown("#### AOI & Satellite Preview")
-    m.to_streamlit(height=500)
-
-    # 3. Run SAM Segmentation
-    st.subheader("3. Run Segmentation")
-    
-    if st.button("Run SAM to Detect Boundaries"):
-        with st.spinner("Downloading image tile and initializing SAM model... (This may take a moment)"):
+        # Show Map
+        m.to_streamlit(width=None)
+        
+        # Results Section
+        st.success("Processing Complete!")
+        
+        # Download Section
+        st.subheader("📥 Download Results")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Generate KML Download Link from GEE
             try:
-                # A. Download Image locally for SAM
-                temp_dir = tempfile.mkdtemp()
-                image_path = os.path.join(temp_dir, 'satellite_image.tif')
-                
-                # Download the RGB bands as a GeoTIFF
-                geemap.ee_export_image(
-                    s2_image.select(['B4', 'B3', 'B2']),
-                    filename=image_path,
-                    scale=10, 
-                    region=aoi,
-                    file_per_band=False
+                download_url = vectors.getDownloadURL(
+                    filetype='kml', 
+                    filename='detected_boundaries'
                 )
-                
-                # B. Initialize SAM
-                # OPTIMIZATION: Force 'cpu' to match requirements.txt installation
-                sam = SamGeo2(
-                    model_id=model_type,
-                    automatic=True,
-                    device='cpu' 
-                )
-                
-                # C. Generate Masks
-                output_mask_path = os.path.join(temp_dir, 'segmentation_mask.tif')
-                output_vector_path = os.path.join(temp_dir, 'field_boundaries.gpkg')
-                
-                st.text("Running inference (this may be slow on CPU)...")
-                sam.generate(
-                    source=image_path,
-                    output=output_mask_path,
-                    foreground=True,
-                    unique=True
-                )
-                
-                # Save as Vector (GeoPackage)
-                sam.tiff_to_vector(output_mask_path, output_vector_path)
-                
-                # D. Display Results
-                st.success("Segmentation Complete!")
-                
-                # Load the result vector to display
-                gdf_result = gpd.read_file(output_vector_path)
-                
-                # Create result map
-                m_result = geemap.Map()
-                m_result.centerObject(aoi, 14)
-                m_result.addLayer(s2_image, vis_params, 'Sentinel-2 Source')
-                m_result.add_gdf(gdf_result, layer_name="Detected Fields", style_color="yellow", fill_colors=["rgba(0,0,0,0)"])
-                
-                st.markdown("#### Detected Boundaries")
-                m_result.to_streamlit(height=500)
-                
-                # E. Download Options
-                with open(output_vector_path, "rb") as f:
-                     st.download_button(
-                         label="Download Boundaries (GeoPackage)",
-                         data=f,
-                         file_name="field_boundaries.gpkg",
-                         mime="application/octet-stream"
-                     )
-                
+                st.markdown(f"[**Click here to download Boundaries (KML)**]({download_url})")
+                st.info("Note: This link is generated by Google Earth Engine servers.")
             except Exception as e:
-                st.error(f"An error occurred during processing: {str(e)}")
-                st.info("Tip: If the app crashes, try a smaller AOI.")
+                st.error(f"Error generating download link: {e}")
 
+        # Cleanup temp file
+        os.unlink(tmp_path)
+
+    except Exception as e:
+        st.error(f"An error occurred processing the file: {e}")
+        st.warning("Ensure your KML contains a valid Polygon geometry.")
 else:
-    st.info("Please upload a KML file to begin.")
+    # Default map view
+    m.to_streamlit()
+    st.info("Please upload a KML file to start.")
+
+def import_datetime_date(y, m, d):
+    from datetime import date
+    return date(y, m, d)
