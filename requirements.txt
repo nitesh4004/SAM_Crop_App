@@ -1,18 +1,4 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-
-Core AI libs (CPU versions explicitly to save space)
-
-torch
-torchvision
-device='cpu'
-App dependencies
-
 streamlit
 geemap
 earthengine-api
-segment-geospatial
-opencv-python-headless
-geopandas
-rasterio
-segment-geospatial
 
