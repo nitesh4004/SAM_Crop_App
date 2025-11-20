@@ -8,6 +8,8 @@ import tempfile
 import rasterio
 from rasterio.plot import show
 import numpy as np
+import pandas as pd # Added missing import for pd.to_datetime
+from google.oauth2 import service_account
 
 # --- Page Configuration ---
 st.set_page_config(layout="wide", page_title="Crop Boundary Detection (SAM 2/3)")
@@ -22,19 +24,35 @@ This app extracts crop boundaries from satellite imagery using **Google Earth En
 with st.sidebar:
     st.header("1. Configuration")
     
-    # GEE Initialization
+    # GEE Initialization with Service Account
     try:
-        ee.Initialize()
-        st.success("GEE Initialized successfully!")
-    except Exception as e:
-        st.warning("GEE not initialized. Attempting authentication...")
-        try:
-            ee.Authenticate()
+        if "gcp_service_account" in st.secrets:
+            # 1. Load secrets
+            service_account_info = dict(st.secrets["gcp_service_account"])
+            
+            # 2. CRITICAL FIX: Handle newline characters in private key
+            # TOML/Streamlit sometimes escapes \n as literal characters. We fix this here.
+            if "private_key" in service_account_info:
+                service_account_info["private_key"] = service_account_info["private_key"].replace("\\n", "\n")
+
+            # 3. Create Credentials
+            creds = service_account.Credentials.from_service_account_info(service_account_info)
+            
+            # 4. Initialize Earth Engine
+            # We explicitly pass the project_id to ensure correct billing/usage attribution
+            project_id = service_account_info.get("project_id")
+            ee.Initialize(credentials=creds, project=project_id)
+            
+            st.success(f"GEE Initialized! \nProject: {project_id}")
+        else:
+            st.warning("Secrets [gcp_service_account] not found. Trying default auth...")
             ee.Initialize()
-            st.success("Authenticated & Initialized!")
-        except Exception as auth_e:
-            st.error(f"Authentication failed: {auth_e}")
-            st.stop()
+            st.success("GEE Initialized (Default)")
+            
+    except Exception as e:
+        st.error(f"GEE Initialization failed: {e}")
+        st.info("Check your .streamlit/secrets.toml file. Ensure the 'private_key' is correct.")
+        st.stop()
 
     st.divider()
     
