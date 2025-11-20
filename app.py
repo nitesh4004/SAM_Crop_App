@@ -8,7 +8,7 @@ import tempfile
 import rasterio
 from rasterio.plot import show
 import numpy as np
-import pandas as pd # Added missing import for pd.to_datetime
+import pandas as pd
 from google.oauth2 import service_account
 
 # --- Page Configuration ---
@@ -30,8 +30,7 @@ with st.sidebar:
             # 1. Load secrets
             service_account_info = dict(st.secrets["gcp_service_account"])
             
-            # 2. CRITICAL FIX: Handle newline characters in private key
-            # TOML/Streamlit sometimes escapes \n as literal characters. We fix this here.
+            # 2. Handle newline characters in private key (Fix for TOML escaping)
             if "private_key" in service_account_info:
                 service_account_info["private_key"] = service_account_info["private_key"].replace("\\n", "\n")
 
@@ -39,7 +38,6 @@ with st.sidebar:
             creds = service_account.Credentials.from_service_account_info(service_account_info)
             
             # 4. Initialize Earth Engine
-            # We explicitly pass the project_id to ensure correct billing/usage attribution
             project_id = service_account_info.get("project_id")
             ee.Initialize(credentials=creds, project=project_id)
             
@@ -64,14 +62,14 @@ with st.sidebar:
     st.divider()
     
     st.header("3. Model Settings")
+    # OPTIMIZATION: Default to 'tiny' (index 2) to prevent memory crashes on Cloud
     model_type = st.selectbox(
         "SAM Model Type", 
         ["sam2_hiera_large", "sam2_hiera_small", "sam2_hiera_tiny"],
-        index=1,
-        help="Larger models are more accurate but require more GPU VRAM."
+        index=2, 
+        help="Use 'Tiny' for Streamlit Cloud. 'Large' requires a powerful local GPU."
     )
     
-    # Explanation for SAM 3
     st.info("For SAM 3: Once 'segment-geospatial' updates, select the SAM 3 checkpoint here.")
 
 # --- Main Logic ---
@@ -95,7 +93,6 @@ if uploaded_kml:
             gpd_df = gpd_df.to_crs("EPSG:4326")
         
         # Convert the first polygon to GEE geometry
-        # (Assuming simple KML with one main polygon for the field)
         aoi_coords = list(gpd_df.geometry[0].exterior.coords)
         aoi = ee.Geometry.Polygon(aoi_coords)
         
@@ -142,7 +139,6 @@ if uploaded_kml:
         with st.spinner("Downloading image tile and initializing SAM model... (This may take a moment)"):
             try:
                 # A. Download Image locally for SAM
-                # SAM works on local numpy arrays, so we export the GEE image to a geotiff
                 temp_dir = tempfile.mkdtemp()
                 image_path = os.path.join(temp_dir, 'satellite_image.tif')
                 
@@ -150,25 +146,24 @@ if uploaded_kml:
                 geemap.ee_export_image(
                     s2_image.select(['B4', 'B3', 'B2']),
                     filename=image_path,
-                    scale=10, # 10m resolution for Sentinel-2
+                    scale=10, 
                     region=aoi,
                     file_per_band=False
                 )
                 
                 # B. Initialize SAM
-                # SAM 2 Initialization
+                # OPTIMIZATION: Force 'cpu' to match requirements.txt installation
                 sam = SamGeo2(
                     model_id=model_type,
-                    automatic=True, # Automatic Mask Generator
-                    device='cuda' if st.checkbox("Use GPU (if available)", value=False) else 'cpu'
+                    automatic=True,
+                    device='cpu' 
                 )
                 
                 # C. Generate Masks
                 output_mask_path = os.path.join(temp_dir, 'segmentation_mask.tif')
                 output_vector_path = os.path.join(temp_dir, 'field_boundaries.gpkg')
                 
-                st.text("Running inference...")
-                # Generate masks
+                st.text("Running inference (this may be slow on CPU)...")
                 sam.generate(
                     source=image_path,
                     output=output_mask_path,
@@ -205,7 +200,7 @@ if uploaded_kml:
                 
             except Exception as e:
                 st.error(f"An error occurred during processing: {str(e)}")
-                st.info("Tip: If running on CPU, try a smaller AOI or the 'Tiny' model.")
+                st.info("Tip: If the app crashes, try a smaller AOI.")
 
 else:
     st.info("Please upload a KML file to begin.")
